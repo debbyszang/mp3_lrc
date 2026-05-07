@@ -3,7 +3,7 @@
 文案朗读 + 字幕生成工具
 
 根据输入的纯文本文件，使用Edge-TTS生成AI语音朗读的MP3音频，
-并同步生成逐句对齐的LRC字幕文件。
+并同步生成逐句对齐的LRC字幕文件。可选生成词级LRC（每个词对应精确时间戳）。
 
 Usage:
     python3 text_to_lrc.py -t 文件名 [选项]
@@ -18,14 +18,18 @@ Examples:
     # 生成 M4A + MKV 字幕文件（需要 ffmpeg）
     python3 text_to_lrc.py -t Kris头像 --mkv
 
+    # 生成词级 LRC（每个词带精确时间戳）
+    python3 text_to_lrc.py -t Kris头像 -w
+
     # 列出所有可用音色
     python3 text_to_lrc.py --list-voices
 
 Output:
-    - {文件名}.mp3       完整朗读音频
-    - {文件名}.lrc       逐句对齐的LRC字幕
-    - {文件名}.m4a       音频+内嵌字幕（需加 --mkv）
-    - {文件名}.mkv       硬字幕封装（需加 --mkv）
+    - {文件名}.mp3        完整朗读音频
+    - {文件名}.lrc        逐句对齐的LRC字幕
+    - {文件名}_word.lrc   逐词对齐的LRC字幕（需加 -w）
+    - {文件名}.m4a        音频+内嵌字幕（需加 --mkv）
+    - {文件名}.mkv        硬字幕封装（需加 --mkv）
 
     生成后自动拷贝到: ~/storage/shared/albert-eng/
 
@@ -37,6 +41,7 @@ Options:
     --rate RATE       语速调节，如 "+20%" 加速，"-10%" 减速
     --list-voices     列出所有可用的音色
     --mkv             生成 M4A + MKV 字幕文件（默认关闭）
+    --word-level/-w   生成词级 LRC（每个词对应精确时间戳）
 """
 
 import argparse
@@ -91,6 +96,14 @@ class Sentence:
     end: float          # 结束时间（秒）
 
 
+@dataclass
+class Word:
+    """一个词的字幕单元"""
+    text: str           # 词文本
+    start: float        # 开始时间（秒）
+    end: float          # 结束时间（秒）
+
+
 def format_srt_time(seconds: float) -> str:
     """将秒数格式化为SRT时间戳 HH:MM:SS,mmm"""
     hours = int(seconds // 3600)
@@ -141,30 +154,39 @@ async def synthesize_text_get_sentences(
     text: str,
     voice: str,
     rate: str,
-) -> tuple[bytes, list[Sentence]]:
+) -> tuple[bytes, list[Sentence], list[Word]]:
     """
-    合成整段文字，返回合并后的音频数据和各句的起止时间。
-    通过两次流遍历：第一次收集音频+句子边界，第二次计算时长。
+    合成整段文字，返回合并后的音频数据、各句的起止时间、各词的起止时间。
+    一次流遍历同时收集 SentenceBoundary 和 WordBoundary。
     """
     communicate = edge_tts.Communicate(text, voice, rate=rate)
     audio_chunks = []
     sentence_boundaries: list[tuple[int, int, str]] = []  # (offset, duration, text)
+    word_boundaries: list[tuple[int, int, str]] = []      # (offset, duration, text)
 
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             audio_chunks.append(chunk["data"])
         elif chunk["type"] == "SentenceBoundary":
             sentence_boundaries.append((chunk["offset"], chunk["duration"], chunk["text"]))
+        elif chunk["type"] == "WordBoundary":
+            word_boundaries.append((chunk["offset"], chunk["duration"], chunk["text"]))
 
     audio_data = b"".join(audio_chunks)
 
-    # 计算每句的起止时间
-    # offset 和 duration 单位是 100 纳秒（10^-7 秒）
+    # 计算每句的起止时间（相对 offset）
     sentences = []
     for offset, duration, text in sentence_boundaries:
         start_sec = offset / 10_000_000
         end_sec = (offset + duration) / 10_000_000
         sentences.append(Sentence(text=text.strip(), start=start_sec, end=end_sec))
+
+    # 计算每个词的起止时间（相对 offset）
+    words = []
+    for offset, duration, text in word_boundaries:
+        start_sec = offset / 10_000_000
+        end_sec = (offset + duration) / 10_000_000
+        words.append(Word(text=text.strip(), start=start_sec, end=end_sec))
 
     # 如果没有 SentenceBoundary（极短文本），用总时长作为整句
     if not sentences:
@@ -176,7 +198,31 @@ async def synthesize_text_get_sentences(
                     total_duration = end_sec
         sentences.append(Sentence(text=text.strip(), start=0.0, end=total_duration))
 
-    return audio_data, sentences
+    return audio_data, sentences, words
+
+
+async def synthesize_text_get_words(
+    text: str,
+    voice: str,
+    rate: str,
+) -> list[Word]:
+    """
+    合成整段文字，返回各词的起止时间（WordBoundary 事件）。
+    需传入 boundary='WordBoundary' 给 Communicate。
+    """
+    communicate = edge_tts.Communicate(text, voice, rate=rate, boundary="WordBoundary")
+    words: list[Word] = []
+
+    async for chunk in communicate.stream():
+        if chunk["type"] == "WordBoundary":
+            offset = chunk["offset"]
+            duration = chunk["duration"]
+            word_text = chunk["text"]
+            start_sec = offset / 10_000_000
+            end_sec = (offset + duration) / 10_000_000
+            words.append(Word(text=word_text.strip(), start=start_sec, end=end_sec))
+
+    return words
 
 
 async def synthesize_paragraph(
@@ -184,9 +230,9 @@ async def synthesize_paragraph(
     voice: str,
     rate: str,
     silence_between: float = 0.5,
-) -> tuple[bytes, list[Sentence], float]:
+) -> tuple[bytes, list[Sentence], list[Word], float]:
     """
-    合成单个段落，返回音频数据、句子列表、全文总时长。
+    合成单个段落，返回音频数据、句子列表、词列表、全文总时长。
 
     Args:
         paragraph: 要合成的段落文本
@@ -195,12 +241,12 @@ async def synthesize_paragraph(
         silence_between: 句子之间的静音时长（秒）
 
     Returns:
-        (audio_data, sentences, total_duration)
+        (audio_data, sentences, words, total_duration)
     """
-    audio_data, sentences = await synthesize_text_get_sentences(paragraph, voice, rate)
+    audio_data, sentences, words = await synthesize_text_get_sentences(paragraph, voice, rate)
 
     if not sentences:
-        return b"", [], 0.0
+        return b"", [], [], 0.0
 
     # 累加句子间的静音，重新计算每句的绝对起始时间
     total = 0.0
@@ -209,8 +255,11 @@ async def synthesize_paragraph(
         total += (sent.end - (sent.start if sent.end > sent.start else 0)) + silence_between
         sent.end = total - silence_between  # 减去最后一个静音
 
+    # 词的时间戳（相对 offset）在主循环中用 current_offset 修正
+    # 此处只返回原始相对值，不做绝对时间转换
+
     total_duration = total - silence_between  # 最后一句不加静音
-    return audio_data, sentences, total_duration
+    return audio_data, sentences, words, total_duration
 
 
 def generate_silence_ms(duration_ms: int) -> bytes:
@@ -236,12 +285,13 @@ async def text_to_subtitles(
     rate: str,
     stem: str,
     generate_mkv: bool = False,
-) -> tuple[str, str, tuple]:
+    word_level: bool = False,
+) -> tuple[str, str, tuple, str]:
     """
     主处理流程：读取文本，分段落合成，生成MP3、LRC、SRT。
 
     Returns:
-        (mp3_path, lrc_path, (m4a_path, mkv_path))
+        (mp3_path, lrc_path, (m4a_path, mkv_path), word_lrc_path)
     """
     with open(input_path, "r", encoding="utf-8") as f:
         raw_lines = f.readlines()
@@ -274,6 +324,7 @@ async def text_to_subtitles(
     os.close(srt_fd)
 
     all_sentences: list[Sentence] = []
+    all_words: list[Word] = []
     current_offset = 0.0
     silence_ms = 500
 
@@ -281,7 +332,7 @@ async def text_to_subtitles(
         for i, para in enumerate(paragraphs, 1):
             print(f"  处理第 {i}/{len(paragraphs)} 段: {para[:40]}{'...' if len(para) > 40 else ''}")
 
-            audio_data, sentences, para_duration = await synthesize_paragraph(
+            audio_data, sentences, _, para_duration = await synthesize_paragraph(
                 para, voice, rate, silence_between=0.0
             )
 
@@ -293,6 +344,14 @@ async def text_to_subtitles(
                 sent.start += current_offset
                 sent.end += current_offset
                 all_sentences.append(sent)
+
+            # 并行获取词级时间戳（音频丢弃，只用时间）
+            if word_level:
+                words = await synthesize_text_get_words(para, voice, rate)
+                for w in words:
+                    w.start += current_offset
+                    w.end += current_offset
+                    all_words.append(w)
 
             # 段落之间加静音间隔
             if i < len(paragraphs):
@@ -314,6 +373,18 @@ async def text_to_subtitles(
             f.write(f"{format_lrc_time(sent.start)}{escape_lrc_text(sent.text)}\n")
 
     print(f"  LRC 生成: {lrc_path}")
+
+    # ---------- 生成词级 LRC ----------
+    word_lrc_path = ""
+    if word_level and all_words:
+        word_lrc_path = os.path.join(output_dir, f"{stem}_word.lrc")
+        with open(word_lrc_path, "w", encoding="utf-8") as f:
+            f.write(f"[ti:{stem} - words]\n")
+            f.write(f"[ar:Edge-TTS]\n")
+            f.write(f"[by:auto]\n")
+            for w in all_words:
+                f.write(f"{format_lrc_time(w.start)}{escape_lrc_text(w.text)}\n")
+        print(f"  词级LRC 生成: {word_lrc_path}  ({len(all_words)} 词)")
 
     # ---------- 生成 SRT（内部使用，封装后删除） ----------
     with open(srt_path, "w", encoding="utf-8") as f:
@@ -342,8 +413,10 @@ async def text_to_subtitles(
     print(f"\n生成完成：")
     print(f"  音频: {mp3_path}")
     print(f"  字幕: {lrc_path}")
+    if word_lrc_path:
+        print(f"  词级LRC: {word_lrc_path}")
 
-    print(f"  总时长: {total_duration:.1f}s  ({len(all_sentences)} 句)")
+    print(f"  总时长: {total_duration:.1f}s  ({len(all_sentences)} 句{', ' + str(len(all_words)) + ' 词' if all_words else ''})")
 
     # ---------- 拷贝到共享目录 ----------
     shared_dir = SHARED_OUTPUT_DIR
@@ -355,6 +428,9 @@ async def text_to_subtitles(
                 dst = os.path.join(shared_dir, os.path.basename(src_path))
                 shutil.copy2(src_path, dst)
                 copied.append(dst)
+        if word_lrc_path and os.path.exists(word_lrc_path):
+            shutil.copy2(word_lrc_path, os.path.join(shared_dir, os.path.basename(word_lrc_path)))
+            copied.append(word_lrc_path)
         if m4a_written and os.path.exists(m4a_written):
             shutil.copy2(m4a_written, os.path.join(shared_dir, os.path.basename(m4a_written)))
             copied.append(m4a_written)
@@ -366,7 +442,7 @@ async def text_to_subtitles(
             for p in copied:
                 print(f"    {p}")
 
-    return mp3_path, lrc_path, (m4a_written, mkv_written)
+    return mp3_path, lrc_path, (m4a_written, mkv_written), word_lrc_path
 
 
 async def list_voices():
@@ -500,6 +576,7 @@ def main():
   python3 text_to_lrc.py -t 我的播客
   python3 text_to_lrc.py --input 其他.txt -t 文件名
   python3 text_to_lrc.py -t 文件名 --mkv   # 生成 M4A + MKV 字幕文件
+  python3 text_to_lrc.py -t 文件名 -w      # 生成词级 LRC（每个词带时间戳）
   python3 text_to_lrc.py --list-voices
         """,
     )
@@ -523,6 +600,8 @@ def main():
                         help="列出所有可用的音色")
     parser.add_argument("--mkv", "-m", action="store_true", default=False,
                         help="生成 M4A + MKV 字幕文件（默认关闭，需 ffmpeg）")
+    parser.add_argument("--word-level", "-w", action="store_true", default=False,
+                        help="同时生成词级 LRC（每个词对应时间戳）")
 
     args = parser.parse_args()
 
@@ -543,11 +622,12 @@ def main():
     print(f"语速: {args.rate}")
     print(f"输出: {args.output}")
     print(f"字幕封装: {'是' if args.mkv else '否'}")
+    print(f"词级LRC: {'是' if args.word_level else '否'}")
     print()
 
     asyncio.run(text_to_subtitles(
         args.input, args.output, voice, args.rate, stem=stem,
-        generate_mkv=args.mkv
+        generate_mkv=args.mkv, word_level=args.word_level
     ))
 
 
